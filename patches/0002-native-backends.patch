@@ -1,0 +1,1205 @@
+diff --git a/vlib/v/driver/driver.v b/vlib/v/driver/driver.v
+index e77dcfcf..1c14f351 100644
+--- a/vlib/v/driver/driver.v
++++ b/vlib/v/driver/driver.v
+@@ -14933,8 +14933,9 @@ pub fn run(args []string) {
+ 			b.metric('SSA blocks before optimize', m.blocks.len, 'blocks')
+ 
+ 			run_ssa_optimizer := is_prod && m.values.len <= amd64_prod_ssa_optimizer_max_values
++			native_scalar := run_ssa_optimizer && 'vopt' in user_defines
+ 			if run_ssa_optimizer {
+-				optimize.optimize(mut m)
++				optimize.optimize_native(mut m, native_scalar)
+ 				b.step('optimize')
+ 			} else if is_prod && verbose {
+ 				eprintln('amd64: skipping global SSA optimizer for ${m.values.len} values to bound compiler memory')
+@@ -14943,6 +14944,7 @@ pub fn run(args []string) {
+ 
+ 			mut g := amd64.Gen.new_with_options(m, amd64.GenOptions{
+ 				optimize_runtime: is_prod
++				native_scalar:    native_scalar
+ 			})
+ 			g.validate_c_extern_calls() or {
+ 				eprintln(err.msg())
+@@ -15169,8 +15171,9 @@ pub fn run(args []string) {
+ 			b.metric('SSA instructions before optimize', m.instrs.len, 'instructions')
+ 			b.metric('SSA blocks before optimize', m.blocks.len, 'blocks')
+ 
++			native_scalar := is_prod && 'vopt' in user_defines
+ 			if is_prod {
+-				optimize.optimize(mut m)
++				optimize.optimize_native(mut m, native_scalar)
+ 				b.step('optimize')
+ 				b.metric('SSA values after optimize', m.values.len, 'values')
+ 				b.metric('SSA instructions after optimize', m.instrs.len, 'instructions')
+@@ -15179,6 +15182,7 @@ pub fn run(args []string) {
+ 			m.release_codegen_analysis_metadata()
+ 
+ 			mut g := arm64.Gen.new(m)
++			g.native_scalar = native_scalar
+ 			g.prune_unused = 'freestanding' in prefs.user_defines
+ 				|| (target.os == 'linux' && !is_o && prefs.hot_fn.len == 0)
+ 			g.freestanding = 'freestanding' in prefs.user_defines
+diff --git a/vlib/v/gen/amd64/gen.v b/vlib/v/gen/amd64/gen.v
+index 0682b655..f9390f8e 100644
+--- a/vlib/v/gen/amd64/gen.v
++++ b/vlib/v/gen/amd64/gen.v
+@@ -8,6 +8,7 @@ import os
+ import v.cmdexec
+ import v.ssa
+ import v.gen.elf
++import v.gen.nativeopt
+ import encoding.binary
+ 
+ const r_x86_64_plt32 = 4
+@@ -16,6 +17,7 @@ const r_x86_64_plt32 = 4
+ pub struct GenOptions {
+ pub:
+ 	optimize_runtime bool
++	native_scalar    bool
+ }
+ 
+ pub struct Gen {
+@@ -23,6 +25,9 @@ pub struct Gen {
+ mut:
+ 	elf              &elf.ElfObject
+ 	optimize_runtime bool
++	native_scalar    bool
++	selection        nativeopt.Selection
++	next_block       ssa.BlockID
+ 
+ 	stack_map      map[int]int
+ 	alloca_offsets map[int]int
+@@ -69,6 +74,7 @@ pub fn Gen.new_with_options(m &ssa.Module, opts GenOptions) &Gen {
+ 		m:                m
+ 		elf:              elf.ElfObject.new(elf.em_x86_64)
+ 		optimize_runtime: opts.optimize_runtime
++		native_scalar:    opts.native_scalar
+ 	}
+ }
+ 
+@@ -304,7 +310,12 @@ fn (mut g Gen) gen_func(func ssa.Function) {
+ 	g.cur_func_abi_ret_indirect = g.is_indirect_return(func.typ)
+ 	g.cur_func_param_indirect = g.indirect_params(func)
+ 	g.sret_save_offset = 0
+-	g.allocate_scalar_registers(func)
++	if g.native_scalar {
++		g.selection.select_local(g.m, func, false)
++		g.allocate_live_registers(func)
++	} else {
++		g.allocate_scalar_registers(func)
++	}
+ 
+ 	// Calculate Stack Frame
+ 	// Start local variables after callee-saved register save area.
+@@ -342,6 +353,9 @@ fn (mut g Gen) gen_func(func ssa.Function) {
+ 	for blk_id in func.blocks {
+ 		blk := g.m.blocks[blk_id]
+ 		for val_id in blk.instrs {
++			if g.native_scalar && val_id in g.selection.skipped {
++				continue
++			}
+ 			val := g.m.values[val_id]
+ 			if val.kind == .phi_result {
+ 				if val_id in g.reg_map {
+@@ -400,6 +414,9 @@ fn (mut g Gen) gen_func(func ssa.Function) {
+ 	for blk_id in func.blocks {
+ 		blk := g.m.blocks[blk_id]
+ 		for val_id in blk.instrs {
++			if g.native_scalar && val_id in g.selection.skipped {
++				continue
++			}
+ 			val := g.m.values[val_id]
+ 			if val.kind != .instruction {
+ 				continue
+@@ -504,6 +521,9 @@ fn (mut g Gen) gen_func(func ssa.Function) {
+ 	}
+ 
+ 	g.stack_size = (slot_offset + 16) & ~0xF
++	if g.native_scalar && g.used_regs.len % 2 != 0 {
++		g.stack_size += 8
++	}
+ 
+ 	g.elf.add_symbol(func.name, u64(g.curr_offset), true, 1)
+ 
+@@ -575,7 +595,8 @@ fn (mut g Gen) gen_func(func ssa.Function) {
+ 		}
+ 	}
+ 
+-	for blk_id in func.blocks {
++	for bi, blk_id in func.blocks {
++		g.next_block = if bi + 1 < func.blocks.len { func.blocks[bi + 1] } else { -1 }
+ 		blk := g.m.blocks[blk_id]
+ 		g.block_offsets[blk_id] = g.elf.text_data.len - g.curr_offset
+ 
+@@ -764,6 +785,11 @@ fn (g &Gen) register_candidate_score(value_id int, use_count int) ?int {
+ 
+ fn (mut g Gen) gen_instr(val_id int) {
+ 	instr := g.m.instrs[g.m.values[val_id].index]
++	if g.native_scalar {
++		if val_id in g.selection.skipped || g.gen_native_scalar(val_id, instr) {
++			return
++		}
++	}
+ 	op := g.selected_opcode(instr)
+ 
+ 	// Temps: 0=RAX, 1=RCX
+@@ -1277,8 +1303,10 @@ fn (mut g Gen) gen_instr(val_id int) {
+ 		.jmp {
+ 			target_idx := int(instr.operands[0])
+ 			g.emit_phi_edge_copies(instr.block, target_idx)
++		if !g.native_scalar || target_idx != g.next_block {
+ 			g.emit_jmp(target_idx)
+ 		}
++		}
+ 		.br {
+ 			cond_id := instr.operands[0]
+ 			true_blk := int(instr.operands[1])
+@@ -2087,6 +2115,10 @@ fn (g Gen) selected_opcode(instr ssa.Instruction) ssa.OpCode {
+ 
+ fn (mut g Gen) emit_jmp(target_idx int) {
+ 	asm_jmp_rel32(mut g)
++	g.emit_jump_displacement(target_idx)
++}
++
++fn (mut g Gen) emit_jump_displacement(target_idx int) {
+ 	if off := g.block_offsets[target_idx] {
+ 		rel := off - (g.elf.text_data.len - g.curr_offset + 4)
+ 		g.emit_u32(u32(rel))
+diff --git a/vlib/v/gen/amd64/native_scalar.v b/vlib/v/gen/amd64/native_scalar.v
+new file mode 100644
+index 00000000..e6d4514a
+--- /dev/null
++++ b/vlib/v/gen/amd64/native_scalar.v
+@@ -0,0 +1,138 @@
++module amd64
++
++import v.gen.nativeopt
++import v.ssa
++
++fn (mut g Gen) gen_native_scalar(id ssa.ValueID, instr ssa.Instruction) bool {
++	if instr.op == .br && instr.operands.len == 3 {
++		then_block := int(instr.operands[1])
++		else_block := int(instr.operands[2])
++		if nativeopt.has_phi(g.m, then_block) || nativeopt.has_phi(g.m, else_block) {
++			return false
++		}
++		mut cond := cc_ne
++		if cmp := g.selection.inputs[id] {
++			g.load_val_to_reg(int(rax), cmp.operands[0])
++			g.load_val_to_reg(int(rcx), cmp.operands[1])
++			asm_cmp_rax_rcx(mut g)
++			cond = amd64_scalar_condition(cmp.op)
++		} else if reg := g.reg_map[instr.operands[0]] {
++			asm_test_reg_reg(mut g, Reg(reg))
++		} else {
++			g.load_val_to_reg(int(rax), instr.operands[0])
++			asm_test_rax_rax(mut g)
++		}
++		if then_block == g.next_block {
++			g.emit_scalar_jump(cond ^ 1, else_block)
++		} else {
++			g.emit_scalar_jump(cond, then_block)
++			if else_block != g.next_block {
++				g.emit_jmp(else_block)
++			}
++		}
++		return true
++	}
++	if address := nativeopt.array_address(g.m, instr) {
++		if off := g.stack_map[address.array] {
++			g.load_val_to_reg(int(rax), address.index)
++			asm_load_reg_rbp_disp(mut g, rcx, off + address.size_offset)
++			asm_imul_rax_rcx(mut g)
++			asm_load_reg_rbp_disp(mut g, rcx, off + address.data_offset)
++			asm_add_rax_rcx(mut g)
++			g.store_reg_to_val(int(rax), id)
++			return true
++		}
++	}
++	if instr.operands.len != 2 || instr.op !in [.get_element_ptr, .udiv, .shl, .lshr, .ashr] {
++		return false
++	}
++	if scaled := g.selection.inputs[id] {
++		g.load_val_to_reg(int(rax), instr.operands[0])
++		g.load_val_to_reg(int(rcx), scaled.operands[0])
++		shift := nativeopt.shift_constant(g.m, scaled.operands[1], 3)
++		// lea rax, [rax + rcx * (1 << shift)]
++		g.emit(0x48)
++		g.emit(0x8d)
++		g.emit(0x04)
++		g.emit(u8(shift << 6) | 0x08)
++		g.store_reg_to_val(int(rax), id)
++		return true
++	}
++	rhs := g.m.values[instr.operands[1]]
++	if rhs.kind != .constant || rhs.name == 'undef' || nativeopt.int_width(g.m, rhs.typ) == 0 {
++		return false
++	}
++	imm := g.integer_constant_value(rhs)
++	if instr.op in [.shl, .lshr, .ashr] && imm >= 0 && imm < 64
++		&& nativeopt.int_width(g.m, g.m.values[instr.operands[0]].typ) == 64
++		&& nativeopt.int_width(g.m, instr.typ) == 64 {
++		g.load_val_to_reg(int(rax), instr.operands[0])
++		if imm != 0 {
++			g.emit(0x48)
++			g.emit(0xc1)
++			g.emit(match instr.op {
++				.shl { u8(0xe0) }
++				.lshr { u8(0xe8) }
++				else { u8(0xf8) }
++			})
++			g.emit(u8(imm))
++		}
++		g.store_reg_to_val(int(rax), id)
++		return true
++	}
++	if instr.op == .get_element_ptr && imm >= min_i32 && imm <= max_i32 {
++		g.load_val_to_reg(int(rax), instr.operands[0])
++		if imm != 0 {
++			g.emit(0x48)
++			g.emit(0x8d)
++			if imm >= -128 && imm <= 127 {
++				g.emit(0x40)
++				g.emit(u8(imm))
++			} else {
++				g.emit(0x80)
++				g.emit_u32(u32(imm))
++			}
++		}
++		g.store_reg_to_val(int(rax), id)
++		return true
++	}
++	if instr.op == .udiv && nativeopt.int_width(g.m, instr.typ) == 64 {
++		magic := nativeopt.division_magic(u64(imm)) or { return false }
++		g.load_val_to_reg(int(rax), instr.operands[0])
++		asm_mov_reg_imm64(mut g, rcx, magic.multiplier)
++		// mul rcx writes the full product to rdx:rax.
++		g.emit(0x48)
++		g.emit(0xf7)
++		g.emit(0xe1)
++		// shr rdx, imm8
++		g.emit(0x48)
++		g.emit(0xc1)
++		g.emit(0xea)
++		g.emit(u8(magic.shift))
++		g.store_reg_to_val(int(rdx), id)
++		return true
++	}
++	return false
++}
++
++fn (mut g Gen) emit_scalar_jump(cc u8, target ssa.BlockID) {
++	g.emit(0x0f)
++	g.emit(0x80 | (cc & 0x0f))
++	g.emit_jump_displacement(target)
++}
++
++fn amd64_scalar_condition(op ssa.OpCode) u8 {
++	return match op {
++		.eq { cc_e }
++		.ne { cc_ne }
++		.lt { cc_l }
++		.gt { cc_g }
++		.le { cc_le }
++		.ge { cc_ge }
++		.ult { cc_b }
++		.ugt { cc_a }
++		.ule { cc_be }
++		.uge { cc_ae }
++		else { cc_ne }
++	}
++}
+diff --git a/vlib/v/gen/amd64/regalloc.v b/vlib/v/gen/amd64/regalloc.v
+new file mode 100644
+index 00000000..cb6a71bc
+--- /dev/null
++++ b/vlib/v/gen/amd64/regalloc.v
+@@ -0,0 +1,184 @@
++module amd64
++
++import v.ssa
++
++struct LiveInterval {
++	id ssa.ValueID
++mut:
++	start      int
++	end        int
++	definition int
++	weight     int
++	use_blocks []int
++}
++
++// allocate_live_registers gives each value one home for its entire live interval.
++// Whole-interval spills preserve the emitter's existing fixed scratch registers
++// and avoid inserting transfers at calls. Every allocatable register survives calls.
++fn (mut g Gen) allocate_live_registers(func ssa.Function) {
++	if func.blocks.len > 1024 {
++		g.allocate_scalar_registers(func)
++		return
++	}
++	mut block_index := map[ssa.BlockID]int{}
++	mut block_start := []int{len: func.blocks.len}
++	mut block_end := []int{len: func.blocks.len}
++	mut preds := [][]int{len: func.blocks.len}
++	mut loop_deltas := []int{len: func.blocks.len + 1}
++	mut positions := 0
++	for bi, block in func.blocks {
++		block_index[block] = bi
++		block_start[bi] = positions
++		positions += g.m.blocks[block].instrs.len + 1
++		block_end[bi] = positions - 1
++	}
++	mut intervals := map[ssa.ValueID]LiveInterval{}
++	for param in func.params {
++		if _ := g.register_candidate_score(param, 1) {
++			intervals[param] = LiveInterval{ id: param, start: -1, end: -1, definition: 0 }
++		}
++	}
++	for bi, block in func.blocks {
++		for at, id in g.m.blocks[block].instrs {
++			val := g.m.values[id]
++			if val.kind != .instruction || id in g.selection.skipped {
++				continue
++			}
++			instr := g.m.instrs[val.index]
++			if instr.op == .inline_asm || instr.op == .phi {
++				// Raw phis and inline assembly can impose unmodeled constraints.
++				return
++			}
++			if instr.op == .assign && g.m.values[instr.operands[0]].kind == .phi_result {
++				dest := instr.operands[0]
++				if dest !in intervals {
++					if _ := g.register_candidate_score(dest, 1) {
++						// Lowered phis have edge definitions. Reserve their home throughout
++						// the function so backedges and cyclic copies cannot overlap it.
++						intervals[dest] = LiveInterval{ id: dest, start: -1, end: positions, definition: -1 }
++					}
++				}
++			}
++			if _ := g.register_candidate_score(id, 1) {
++				pos := block_start[bi] + at
++				intervals[id] = LiveInterval{ id: id, start: pos, end: pos, definition: bi }
++			}
++			for oi, operand in instr.operands {
++				if instr.is_successor_operand(oi) {
++					if successor := block_index[operand] {
++						preds[successor] << bi
++						if successor <= bi {
++							loop_deltas[successor]++
++							loop_deltas[bi + 1]--
++						}
++					}
++				}
++			}
++		}
++	}
++	mut depth := 0
++	for bi, block in func.blocks {
++		depth += loop_deltas[bi]
++		weight := 1 + depth * 4
++		for at, id in g.m.blocks[block].instrs {
++			val := g.m.values[id]
++			if val.kind != .instruction || id in g.selection.skipped {
++				continue
++			}
++			pos := block_start[bi] + at
++			add_live_uses(mut intervals, g.m.instrs[val.index], bi, pos, weight)
++			if producer := g.selection.inputs[id] {
++				add_live_uses(mut intervals, producer, bi, pos, weight)
++			}
++		}
++	}
++	mut live := []LiveInterval{cap: intervals.len}
++	mut seen := []int{len: func.blocks.len}
++	mut pending := []int{}
++	mut stamp := 0
++	for _, interval in intervals {
++		if interval.weight == 0 {
++			continue
++		}
++		mut iv := interval
++		if iv.use_blocks.len > 0 {
++			stamp++
++			pending << iv.use_blocks
++			for pending.len > 0 {
++				block := pending.pop()
++				if seen[block] == stamp {
++					continue
++				}
++				seen[block] = stamp
++				if block == iv.definition {
++					// The value is live from its definition to every outgoing edge.
++					if block_end[block] > iv.end {
++						iv.end = block_end[block]
++					}
++					continue
++				}
++				if block_start[block] < iv.start {
++					iv.start = block_start[block]
++				}
++				if block_end[block] > iv.end {
++					iv.end = block_end[block]
++				}
++				pending << preds[block]
++			}
++		}
++		live << iv
++	}
++	live.sort(a.start < b.start)
++	g.scan_live_intervals(live)
++}
++
++fn add_live_uses(mut intervals map[ssa.ValueID]LiveInterval, instr ssa.Instruction, block int, pos int, weight int) {
++	for i, operand in instr.operands {
++		if !instr.is_value_operand(i) || (instr.op == .assign && i == 0) {
++			continue
++		}
++		if interval := intervals[operand] {
++			mut iv := interval
++			if iv.end < pos {
++				iv.end = pos
++			}
++			iv.weight += weight
++			if iv.definition >= 0 && iv.definition != block
++				&& (iv.use_blocks.len == 0 || iv.use_blocks.last() != block) {
++				iv.use_blocks << block
++			}
++			intervals[operand] = iv
++		}
++	}
++}
++
++fn (mut g Gen) scan_live_intervals(intervals []LiveInterval) {
++	regs := [int(rbx), int(r12), int(r13), int(r14), int(r15)]!
++	mut active := [5]LiveInterval{}
++	for iv in intervals {
++		mut victim := 0
++		for slot, resident in active {
++			if resident.id == 0 || resident.end < iv.start {
++				victim = slot
++				break
++			}
++			if resident.weight < active[victim].weight
++				|| (resident.weight == active[victim].weight && resident.end > active[victim].end) {
++				victim = slot
++			}
++		}
++		old := active[victim]
++		if old.id != 0 && old.end >= iv.start {
++			if old.weight > iv.weight || (old.weight == iv.weight && old.end <= iv.end) {
++				continue
++			}
++			g.reg_map.delete(old.id)
++		}
++		reg := regs[victim]
++		g.reg_map[iv.id] = reg
++		if reg !in g.used_regs {
++			g.used_regs << reg
++		}
++		active[victim] = iv
++	}
++}
+diff --git a/vlib/v/gen/arm64/asm.v b/vlib/v/gen/arm64/asm.v
+index 4c5b8014..50f4a218 100644
+--- a/vlib/v/gen/arm64/asm.v
++++ b/vlib/v/gen/arm64/asm.v
+@@ -95,6 +95,10 @@ fn asm_mul(rd Reg, rn Reg, rm Reg) u32 {
+ 	return 0x9B007C00 | (u32(rm) << 16) | (u32(rn) << 5) | u32(rd)
+ }
+ 
++fn asm_madd(rd Reg, rn Reg, rm Reg, ra Reg) u32 {
++	return 0x9b000000 | (u32(rm) << 16) | (u32(ra) << 10) | (u32(rn) << 5) | u32(rd)
++}
++
+ // sdiv rd, rn, rm
+ fn asm_sdiv(rd Reg, rn Reg, rm Reg) u32 {
+ 	return 0x9AC00C00 | (u32(rm) << 16) | (u32(rn) << 5) | u32(rd)
+diff --git a/vlib/v/gen/arm64/gen.v b/vlib/v/gen/arm64/gen.v
+index 8c29d0fb..2c645b7b 100644
+--- a/vlib/v/gen/arm64/gen.v
++++ b/vlib/v/gen/arm64/gen.v
+@@ -1,6 +1,7 @@
+ module arm64
+ 
+ import v.ssa
++import v.gen.nativeopt
+ 
+ // Gen stores state for ARM64 code generation.
+ pub struct Gen {
+@@ -19,6 +20,8 @@ mut:
+ 	saved_callee_pairs  int
+ 	saved_float_pairs   int
+ 	current_instr_start int
++	selection           nativeopt.Selection
++	next_block          ssa.BlockID
+ 	value_homes         []u8
+ 	value_home_ids      []int
+ 	// Register allocation tables, reused across functions (see regalloc.v).
+@@ -60,6 +63,7 @@ mut:
+ 	// prune_unused emits only the functions reachable from main and exports
+ 	// (freestanding objects register helpers the program may never call).
+ pub mut:
++	native_scalar bool
+ 	prune_unused bool
+ 	// freestanding links the program's own runtime definitions of libc-named
+ 	// symbols (see Linker.freestanding).
+@@ -522,6 +526,9 @@ fn (mut g Gen) gen_func(func_idx int) {
+ 	g.pending_jmps.clear()
+ 
+ 	g.reset_block_offsets(&func)
++	if g.native_scalar {
++		g.selection.select_local(g.m, func, true)
++	}
+ 
+ 	// Frame layout (all at negative offsets from fp):
+ 	// fp + 0: saved fp
+@@ -538,6 +545,9 @@ fn (mut g Gen) gen_func(func_idx int) {
+ 	}
+ 
+ 	for _, pid in func.params {
++		if g.native_scalar && g.value_home_reg(pid) != 0 {
++			continue
++		}
+ 		param_val := g.m.values[pid]
+ 		param_size := g.m.type_size(param_val.typ)
+ 		alloc_size := if param_size > 8 { (param_size + 7) & ~7 } else { 8 }
+@@ -548,6 +558,9 @@ fn (mut g Gen) gen_func(func_idx int) {
+ 	for blk_id in func.blocks {
+ 		blk := g.m.blocks[blk_id]
+ 		for val_id in blk.instrs {
++			if g.native_scalar && val_id in g.selection.skipped {
++				continue
++			}
+ 			val := g.m.values[val_id]
+ 			if val.kind != .instruction {
+ 				continue
+@@ -657,6 +670,17 @@ fn (mut g Gen) gen_func(func_idx int) {
+ 			continue
+ 		}
+ 		n_words := if param_size > 8 { (param_size + 7) / 8 } else { 1 }
++		if g.native_scalar && g.value_home_reg(pid) != 0 {
++			home := g.value_home_reg(pid)
++			if reg_idx < 8 {
++				g.emit32(asm_mov_reg(Reg(home), Reg(reg_idx)))
++				reg_idx++
++			} else {
++				g.emit_load_fp(home, stack_arg_off)
++				stack_arg_off += 8
++			}
++			continue
++		}
+ 		off := g.stack_slot(pid) or { 0 }
+ 		if reg_idx + n_words <= 8 {
+ 			for wi in 0 .. n_words {
+@@ -673,7 +697,8 @@ fn (mut g Gen) gen_func(func_idx int) {
+ 	}
+ 
+ 	// Generate blocks
+-	for blk_id in func.blocks {
++	for bi, blk_id in func.blocks {
++		g.next_block = if bi + 1 < func.blocks.len { func.blocks[bi + 1] } else { -1 }
+ 		g.set_block_offset(blk_id, g.text_offset())
+ 		g.resolve_pending_jmps(blk_id)
+ 		blk := g.m.blocks[blk_id]
+@@ -998,6 +1023,11 @@ fn (mut g Gen) gen_instr(val_id int) {
+ 		return
+ 	}
+ 	instr := g.m.instrs[val.index]
++	if g.native_scalar {
++		if val_id in g.selection.skipped || g.gen_native_scalar(val_id, instr) {
++			return
++		}
++	}
+ 
+ 	match instr.op {
+ 		.alloca {
+@@ -1482,8 +1512,13 @@ fn (mut g Gen) gen_instr(val_id int) {
+ 			}
+ 			target_blk := int(instr.operands[0])
+ 			g.emit_phi_edge_copies(instr.block, target_blk)
++			if g.native_scalar && g.emit_scalar_loop_backedge(target_blk) {
++				return
++			}
++		if !g.native_scalar || target_blk != g.next_block {
+ 			g.emit_branch_to_block(target_blk)
+ 		}
++		}
+ 		.unreachable {
+ 			g.emit32(asm_udf())
+ 		}
+@@ -2529,6 +2564,10 @@ fn (mut g Gen) emit_phi_copy_value(src_id int, dst_id int) {
+ 		return
+ 	}
+ 	src_reg := g.load_val(src_id, 8)
++	if g.native_scalar {
++		g.store_val(src_reg, dst_id)
++		return
++	}
+ 	if src_reg != 8 {
+ 		g.emit32(asm_mov_reg(Reg(8), Reg(src_reg)))
+ 	}
+diff --git a/vlib/v/gen/arm64/gen_parallel.c.v b/vlib/v/gen/arm64/gen_parallel.c.v
+index ffa43eff..32e0c4c0 100644
+--- a/vlib/v/gen/arm64/gen_parallel.c.v
++++ b/vlib/v/gen/arm64/gen_parallel.c.v
+@@ -184,6 +184,7 @@ fn (mut g Gen) free_tables() {
+ fn arm64_gen_worker(arg voidptr) voidptr {
+ 	mut batch := unsafe { &Arm64GenBatch(arg) }
+ 	mut g := Gen.new(batch.parent.m)
++	g.native_scalar = batch.parent.native_scalar
+ 	g.freestanding = batch.parent.freestanding
+ 	g.gc_runtime = batch.parent.gc_runtime
+ 	unsafe {
+diff --git a/vlib/v/gen/arm64/native_scalar.v b/vlib/v/gen/arm64/native_scalar.v
+new file mode 100644
+index 00000000..185b5ffd
+--- /dev/null
++++ b/vlib/v/gen/arm64/native_scalar.v
+@@ -0,0 +1,192 @@
++module arm64
++
++import v.gen.nativeopt
++import v.ssa
++
++fn (mut g Gen) gen_native_scalar(id ssa.ValueID, instr ssa.Instruction) bool {
++	if producer := g.selection.inputs[id] {
++		match instr.op {
++			.br {
++				lhs := g.load_val(producer.operands[0], 8)
++				rhs := g.load_val(producer.operands[1], 9)
++				g.emit32(asm_cmp_reg(Reg(lhs), Reg(rhs)))
++				g.emit_scalar_branch(instr, scalar_condition(producer.op), 0)
++			}
++			.get_element_ptr {
++				base := g.load_val(instr.operands[0], 8)
++				index := g.load_val(producer.operands[0], 9)
++				if producer.op == .mul {
++					scale := g.load_val(producer.operands[1], 10)
++					g.emit32(asm_madd(Reg(8), Reg(index), Reg(scale), Reg(base)))
++				} else {
++					shift := nativeopt.shift_constant(g.m, producer.operands[1], 3)
++					g.emit32(asm_add_reg(Reg(8), Reg(base), Reg(index)) | u32(shift << 10))
++				}
++				g.store_val(8, id)
++			}
++			.add {
++				first := g.load_val(producer.operands[0], 8)
++				second := g.load_val(producer.operands[1], 9)
++				addend_id := if instr.operands[0] in g.selection.skipped {
++					instr.operands[1]
++				} else {
++					instr.operands[0]
++				}
++				addend := g.load_val(addend_id, 10)
++				g.emit32(asm_madd(Reg(8), Reg(first), Reg(second), Reg(addend)))
++				g.store_val(8, id)
++			}
++			else { return false }
++		}
++		return true
++	}
++	if instr.op == .br && instr.operands.len == 3 {
++		reg := g.load_val(instr.operands[0], 8)
++		g.emit_scalar_branch(instr, -1, reg)
++		return true
++	}
++	if instr.op == .bitcast && instr.operands.len == 1 {
++		source := g.m.type_store.types[g.m.values[instr.operands[0]].typ]
++		result := g.m.type_store.types[instr.typ]
++		same_word := (source.kind == .ptr_t && result.kind == .ptr_t)
++			|| (source.kind == .int_t && result.kind == .int_t && source.width == 64 && result.width == 64)
++		if same_word {
++			reg := g.load_val(instr.operands[0], 8)
++			g.store_val(reg, id)
++			return true
++		}
++	}
++	if instr.op == .select && instr.operands.len == 3 && nativeopt.int_width(g.m, instr.typ) in [
++		1,
++		8,
++		16,
++		32,
++		64,
++	] {
++		cond := g.load_val(instr.operands[0], 8)
++		lhs := g.load_val(instr.operands[1], 9)
++		rhs := g.load_val(instr.operands[2], 10)
++		g.emit32(asm_cmp_imm(Reg(cond), 0))
++		// csel x8, lhs, rhs, ne
++		g.emit32(0x9a801000 | u32(rhs << 16) | u32(lhs << 5) | 8)
++		g.store_val(8, id)
++		return true
++	}
++	if address := nativeopt.array_address(g.m, instr) {
++		if off := g.stack_slot(address.array) {
++			// Read the two fields the synthetic helper uses without copying the header.
++			g.emit_load_fp(8, off + address.data_offset)
++			g.emit_load_fp(9, off + address.size_offset)
++			index := g.load_val(address.index, 10)
++			g.emit32(asm_madd(Reg(8), Reg(index), Reg(9), Reg(8)))
++			g.store_val(8, id)
++			return true
++		}
++	}
++	if instr.operands.len != 2 || instr.op !in [.add, .sub, .get_element_ptr, .udiv, .shl, .lshr] {
++		return false
++	}
++	rhs := g.m.values[instr.operands[1]]
++	if rhs.kind != .constant || rhs.name == 'undef' || nativeopt.int_width(g.m, rhs.typ) == 0 {
++		return false
++	}
++	imm := parse_arm64_int(rhs.name)
++	width := nativeopt.int_width(g.m, instr.typ)
++	if instr.op == .udiv && width == 64 {
++		magic := nativeopt.division_magic(u64(imm)) or { return false }
++		lhs := g.load_val(instr.operands[0], 8)
++		g.emit_mov_imm(9, i64(magic.multiplier))
++		g.emit32(asm_umulh(Reg(8), Reg(lhs), Reg(9)))
++		g.emit32(asm_lsr_imm(Reg(8), Reg(8), u32(magic.shift)))
++		g.store_val(8, id)
++		return true
++	}
++	if instr.op in [.shl, .lshr] && width == 64 && imm > 0 && imm < 64 {
++		lhs := g.load_val(instr.operands[0], 8)
++		if instr.op == .lshr {
++			g.emit32(asm_lsr_imm(Reg(8), Reg(lhs), u32(imm)))
++		} else {
++			g.emit32(0xd3400000 | (u32(64 - imm) << 16) | (u32(63 - imm) << 10) | u32(lhs << 5) | 8)
++		}
++		g.store_val(8, id)
++		return true
++	}
++	if instr.op !in [.add, .sub, .get_element_ptr] || imm < 0 || imm >= 4096
++		|| (width == 0 && g.m.type_store.types[instr.typ].kind != .ptr_t) {
++		return false
++	}
++	lhs := g.load_val(instr.operands[0], 8)
++	if instr.op == .sub {
++		g.emit32(asm_sub_imm(Reg(8), Reg(lhs), u32(imm)))
++	} else {
++		g.emit32(asm_add_imm(Reg(8), Reg(lhs), u32(imm)))
++	}
++	if instr.op != .get_element_ptr {
++		g.emit_wrap_to_width(8, instr.typ)
++	}
++	g.store_val(8, id)
++	return true
++}
++
++fn scalar_condition(op ssa.OpCode) int {
++	return match op {
++		.eq { 0 }
++		.ne { 1 }
++		.uge { 2 }
++		.ult { 3 }
++		.ugt { 8 }
++		.ule { 9 }
++		.ge { 10 }
++		.lt { 11 }
++		.gt { 12 }
++		.le { 13 }
++		else { -1 }
++	}
++}
++
++fn (mut g Gen) emit_scalar_branch(instr ssa.Instruction, cond int, reg int) {
++	then_block := int(instr.operands[1])
++	else_block := int(instr.operands[2])
++	if then_block == g.next_block {
++		g.emit32(if cond < 0 { asm_cbnz(Reg(reg), 2) } else { asm_b_cond(u32(cond), 2) })
++		g.emit_branch_to_block(else_block)
++	} else if else_block == g.next_block {
++		g.emit32(if cond < 0 { asm_cbz(Reg(reg), 2) } else { asm_b_cond(u32(cond ^ 1), 2) })
++		g.emit_branch_to_block(then_block)
++	} else {
++		g.emit32(if cond < 0 { asm_cbnz(Reg(reg), 2) } else { asm_b_cond(u32(cond), 2) })
++		g.emit_branch_to_block(else_block)
++		g.emit_branch_to_block(then_block)
++	}
++}
++
++// A jump to a pure loop test can perform the comparison on the backedge.
++// The taken edge is a single conditional branch to an already emitted block.
++fn (mut g Gen) emit_scalar_loop_backedge(header ssa.BlockID) bool {
++	if _ := g.block_offset(header) {
++		ids := g.m.blocks[header].instrs
++		if ids.len != 2 {
++			return false
++		}
++		cmp := g.selection.inputs[ids[1]] or { return false }
++		branch := g.m.instrs[g.m.values[ids[1]].index]
++		if branch.op != .br {
++			return false
++		}
++		body := g.block_offset(branch.operands[1]) or { return false }
++		distance := g.text_offset() - body
++		if distance < 0 || distance >= (1 << 20) - 64 {
++			return false
++		}
++		lhs := g.load_val(cmp.operands[0], 8)
++		rhs := g.load_val(cmp.operands[1], 9)
++		g.emit32(asm_cmp_reg(Reg(lhs), Reg(rhs)))
++		g.emit32(asm_b_cond(u32(scalar_condition(cmp.op)), i32((body - g.text_offset()) / 4)))
++		exit_block := branch.operands[2]
++		if exit_block != g.next_block {
++			g.emit_branch_to_block(exit_block)
++		}
++		return true
++	}
++	return false
++}
+diff --git a/vlib/v/gen/arm64/regalloc.v b/vlib/v/gen/arm64/regalloc.v
+index 003ce2a5..3d65cd09 100644
+--- a/vlib/v/gen/arm64/regalloc.v
++++ b/vlib/v/gen/arm64/regalloc.v
+@@ -1,6 +1,7 @@
+ module arm64
+ 
+ import v.ssa
++import v.gen.nativeopt
+ 
+ // Register allocation for the arm64 backend.
+ //
+@@ -43,6 +44,7 @@ struct LiveInterval {
+ mut:
+ 	start   int
+ 	end     int
++	weight  int
+ 	crosses bool
+ }
+ 
+@@ -54,9 +56,10 @@ struct RaLink {
+ 
+ // RaActive is an interval that currently holds a register.
+ struct RaActive {
+-	value int
+-	end   int
+-	reg   int
++	value  int
++	end    int
++	reg    int
++	weight int
+ }
+ 
+ // value_home_reg returns the register a value lives in, or 0. The table covers
+@@ -189,6 +192,32 @@ fn (mut g Gen) regalloc_function(func &ssa.Function) int {
+ 	for bi, blk_id in func.blocks {
+ 		g.ra_block_index[int(blk_id) - g.block_offset_base] = bi + 1
+ 	}
++	mut weights := []int{}
++	if g.native_scalar {
++		// Backward layout edges identify the blocks where spills are most costly.
++		mut diff := []int{len: func.blocks.len + 1}
++		for bi, block in func.blocks {
++			first, second := g.regalloc_successors(block)
++			for succ in [first, second] {
++				target := g.regalloc_block_index(succ)
++				if target >= 0 && target <= bi {
++					diff[target]++
++					diff[bi + 1]--
++				}
++			}
++		}
++		mut depth := 0
++		for bi in 0 .. func.blocks.len {
++			depth += diff[bi]
++			weights << (1 + 4 * depth)
++		}
++		for param in func.params {
++			if nativeopt.int_width(g.m, g.m.values[param].typ) == 64 {
++				g.ra_value_block[param - g.slot_value_base] = 0
++				g.regalloc_add_interval(param, -1)
++			}
++		}
++	}
+ 	mut pos := 0
+ 	// Definitions first: a use can precede its definition in layout order.
+ 	for bi, blk_id in func.blocks {
+@@ -226,7 +255,7 @@ fn (mut g Gen) regalloc_function(func &ssa.Function) int {
+ 					g.regalloc_mark_crossing(index)
+ 				}
+ 			}
+-			if g.regalloc_eligible(val_id, instr) {
++			if g.regalloc_eligible(val_id, instr) && !(g.native_scalar && val_id in g.selection.skipped) {
+ 				g.ra_value_block[int(val_id) - g.slot_value_base] = bi
+ 				g.regalloc_add_interval(val_id, pos)
+ 			}
+@@ -242,10 +271,16 @@ fn (mut g Gen) regalloc_function(func &ssa.Function) int {
+ 	}
+ 	pos = 0
+ 	for bi, blk_id in func.blocks {
++		weight := if g.native_scalar { weights[bi] } else { 0 }
+ 		for val_id in g.m.blocks[blk_id].instrs {
+ 			val := g.m.values[val_id]
+-			if val.kind == .instruction {
+-				g.regalloc_scan_operands(g.m.instrs[val.index], pos, bi)
++			if val.kind == .instruction && !(g.native_scalar && val_id in g.selection.skipped) {
++				g.regalloc_scan_operands(g.m.instrs[val.index], pos, bi, weight)
++				if g.native_scalar {
++					if producer := g.selection.inputs[val_id] {
++						g.regalloc_scan_operands(producer, pos, bi, weight)
++					}
++				}
+ 			}
+ 			pos++
+ 		}
+@@ -275,7 +310,7 @@ fn (mut g Gen) regalloc_function(func &ssa.Function) int {
+ 
+ // regalloc_scan_operands extends the intervals of an instruction's operands to
+ // `pos` and records the blocks that use a value outside its own block.
+-fn (mut g Gen) regalloc_scan_operands(instr ssa.Instruction, pos int, bi int) {
++fn (mut g Gen) regalloc_scan_operands(instr ssa.Instruction, pos int, bi int, weight int) {
+ 	for i, operand_id in instr.operands {
+ 		operand := int(operand_id)
+ 		if !regalloc_operand_is_value(instr.op, i) || (instr.op == .assign && i == 0) {
+@@ -285,6 +320,7 @@ fn (mut g Gen) regalloc_scan_operands(instr ssa.Instruction, pos int, bi int) {
+ 		if index < 0 {
+ 			continue
+ 		}
++		g.ra_list[index].weight += weight
+ 		if instr.op == .phi {
+ 			// Used on the incoming edge, at the end of the predecessor.
+ 			pred := g.regalloc_block_index(int(instr.operands[i + 1]))
+@@ -503,27 +539,31 @@ fn (mut g Gen) linear_scan(intervals []LiveInterval, first_reg int, last_reg int
+ 			g.regalloc_assign_home(iv.value, reg, home_base)
+ 			highest = arm64_max_int(highest, reg)
+ 			active[active_len] = RaActive{
+-				value: iv.value
+-				end:   iv.end
+-				reg:   reg
++				value:  iv.value
++				end:    iv.end
++				reg:    reg
++				weight: iv.weight
+ 			}
+ 			active_len++
+ 			continue
+ 		}
+ 		mut furthest := 0
+ 		for j in 0 .. active_len {
+-			if active[j].end > active[furthest].end {
++			if active[j].weight < active[furthest].weight
++				|| (active[j].weight == active[furthest].weight && active[j].end > active[furthest].end) {
+ 				furthest = j
+ 			}
+ 		}
+-		if active[furthest].end > iv.end {
++		if active[furthest].weight < iv.weight
++			|| (active[furthest].weight == iv.weight && active[furthest].end > iv.end) {
+ 			victim := active[furthest]
+ 			g.value_homes[victim.value - g.slot_value_base] = 0
+ 			g.regalloc_assign_home(iv.value, victim.reg, home_base)
+ 			active[furthest] = RaActive{
+-				value: iv.value
+-				end:   iv.end
+-				reg:   victim.reg
++				value:  iv.value
++				end:    iv.end
++				reg:    victim.reg
++				weight: iv.weight
+ 			}
+ 		}
+ 	}
+diff --git a/vlib/v/gen/nativeopt/nativeopt.v b/vlib/v/gen/nativeopt/nativeopt.v
+new file mode 100644
+index 00000000..41533fa7
+--- /dev/null
++++ b/vlib/v/gen/nativeopt/nativeopt.v
+@@ -0,0 +1,161 @@
++module nativeopt
++
++import v.ssa
++
++// Selection records adjacent, single-use producers folded into consumers.
++pub struct Selection {
++pub mut:
++	inputs  map[ssa.ValueID]ssa.Instruction
++	skipped map[ssa.ValueID]bool
++}
++
++// select_local finds integer compare/branch, scaled GEP, and optional multiply/add pairs.
++pub fn (mut result Selection) select_local(m &ssa.Module, func ssa.Function, mul_add bool) {
++	result.inputs.clear()
++	result.skipped.clear()
++	mut uses := map[ssa.ValueID]int{}
++	for block in func.blocks {
++		for id in m.blocks[block].instrs {
++			value := m.values[id]
++			if value.kind != .instruction {
++				continue
++			}
++			instr := m.instrs[value.index]
++			for i, operand in instr.operands {
++				if instr.is_value_operand(i) && m.values[operand].kind == .instruction {
++					uses[operand]++
++				}
++			}
++		}
++	}
++	for block in func.blocks {
++		ids := m.blocks[block].instrs
++		for i in 1 .. ids.len {
++			producer := m.values[ids[i - 1]]
++			consumer := m.values[ids[i]]
++			if producer.kind != .instruction || consumer.kind != .instruction
++				|| uses[producer.id] != 1 || producer.id in result.inputs {
++				continue
++			}
++			input := m.instrs[producer.index]
++			output := m.instrs[consumer.index]
++			if input.operands.len != 2 || output.operands.len < 2 {
++				continue
++			}
++			compare := output.op == .br && output.operands.len == 3 && output.operands[0] == producer.id
++				&& is_int_compare(m, input) && !has_phi(m, output.operands[1])
++				&& !has_phi(m, output.operands[2])
++			address := output.op == .get_element_ptr && output.operands[1] == producer.id
++				&& input.op == .shl && int_width(m, input.typ) == 64
++				&& int_width(m, m.values[input.operands[0]].typ) == 64
++				&& shift_constant(m, input.operands[1], 3) != 0
++			multiply := mul_add && output.op == .add && producer.id in output.operands
++				&& input.op == .mul && int_width(m, input.typ) == 64 && output.typ == input.typ
++			multiply_address := mul_add && output.op == .get_element_ptr && output.operands[1] == producer.id
++				&& input.op == .mul && int_width(m, input.typ) == 64
++			if compare || address || multiply || multiply_address {
++				result.inputs[consumer.id] = input
++				result.skipped[producer.id] = true
++			}
++		}
++	}
++}
++
++// int_width returns zero for values that do not have an integer representation.
++pub fn int_width(m &ssa.Module, typ ssa.TypeID) int {
++	if typ <= 0 || typ >= m.type_store.types.len || m.type_store.types[typ].kind != .int_t {
++		return 0
++	}
++	return m.type_store.types[typ].width
++}
++
++fn is_int_compare(m &ssa.Module, instr ssa.Instruction) bool {
++	return instr.op in [.eq, .ne, .lt, .gt, .le, .ge, .ult, .ugt, .ule, .uge]
++		&& int_width(m, m.values[instr.operands[0]].typ) in [1, 8, 16, 32, 64]
++		&& int_width(m, m.values[instr.operands[1]].typ) in [1, 8, 16, 32, 64]
++}
++
++// shift_constant accepts a positive constant shift up to the target's limit.
++pub fn shift_constant(m &ssa.Module, id ssa.ValueID, limit int) int {
++	val := m.values[id]
++	if val.kind != .constant {
++		return 0
++	}
++	shift := val.name.parse_int(10, 32) or { return 0 }
++	return if shift > 0 && shift <= limit { int(shift) } else { 0 }
++}
++
++// has_phi reports whether an edge still requires the generator to emit phi copies.
++pub fn has_phi(m &ssa.Module, block ssa.BlockID) bool {
++	for id in m.blocks[block].instrs {
++		val := m.values[id]
++		if val.kind == .instruction {
++			return m.instrs[val.index].op == .phi
++		}
++	}
++	return false
++}
++
++// ArrayAddress describes the data and element-size fields read by native array_get.
++pub struct ArrayAddress {
++pub:
++	array       ssa.ValueID
++	index       ssa.ValueID
++	data_offset int
++	size_offset int
++}
++
++// array_address recognizes the synthetic unchecked helper, using its SSA ID.
++pub fn array_address(m &ssa.Module, instr ssa.Instruction) ?ArrayAddress {
++	if instr.op != .call || instr.operands.len != 3 || m.native_array_get == 0 {
++		return none
++	}
++	callee := m.values[instr.operands[0]]
++	if callee.kind != .func_ref || callee.index + 1 != m.native_array_get {
++		return none
++	}
++	func := m.funcs[callee.index]
++	if func.params.len != 2 {
++		return none
++	}
++	array := instr.operands[1]
++	typ := m.values[array].typ
++	if typ != m.values[func.params[0]].typ || int_width(m, m.type_store.types[typ].fields[5]) != 64 {
++		return none
++	}
++	return ArrayAddress{array, instr.operands[2], m.struct_field_offset(typ, 0), m.struct_field_offset(typ, 5)}
++}
++
++// DivisionMagic describes an exact unsigned division using a high multiply and shift.
++pub struct DivisionMagic {
++pub:
++	multiplier u64
++	shift      int
++}
++
++// division_magic computes ceil(2^(64+k)/d), where k = floor(log2(d)).
++// Use the sequence only when rounding error guarantees the result for every u64.
++pub fn division_magic(d u64) ?DivisionMagic {
++	if d < 3 || d & (d - 1) == 0 {
++		return none
++	}
++	mut shift := 0
++	for shift < 63 && d >> (shift + 1) > 0 {
++		shift++
++	}
++	mut remainder := u64(1) << shift
++	mut quotient := u64(0)
++	for _ in 0 .. 64 {
++		carry := remainder >> 63 != 0
++		remainder <<= 1
++		quotient <<= 1
++		if carry || remainder >= d {
++			remainder -= d
++			quotient |= 1
++		}
++	}
++	if d - remainder > u64(1) << shift {
++		return none
++	}
++	return DivisionMagic{quotient + 1, shift}
++}
+diff --git a/vlib/v/gen/nativeopt/nativeopt_test.v b/vlib/v/gen/nativeopt/nativeopt_test.v
+new file mode 100644
+index 00000000..c7a1c4c0
+--- /dev/null
++++ b/vlib/v/gen/nativeopt/nativeopt_test.v
+@@ -0,0 +1,29 @@
++module nativeopt
++
++fn high_product(a u64, b u64) u64 {
++	mask := u64(0xffffffff)
++	a_lo, a_hi := a & mask, a >> 32
++	b_lo, b_hi := b & mask, b >> 32
++	first := a_hi * b_lo + ((a_lo * b_lo) >> 32)
++	second := a_lo * b_hi + (first & mask)
++	return a_hi * b_hi + (first >> 32) + (second >> 32)
++}
++
++fn test_division_magic_matches_unsigned_division() {
++	mut state := u64(0x1c17077a9812bb1c)
++	for d in [u64(3), 5, 7, 10, 31, 63, 1000, 0x8000000000000001, max_u64] {
++		magic := division_magic(d) or { continue }
++		for n in [u64(0), 1, d - 1, d, max_u64 - 1, max_u64] {
++			assert high_product(n, magic.multiplier) >> magic.shift == n / d
++		}
++		for _ in 0 .. 1000 {
++			state ^= state << 13
++			state ^= state >> 7
++			state ^= state << 17
++			assert high_product(state, magic.multiplier) >> magic.shift == state / d
++		}
++	}
++	assert division_magic(10) != none
++	assert division_magic(0) == none
++	assert division_magic(32) == none
++}

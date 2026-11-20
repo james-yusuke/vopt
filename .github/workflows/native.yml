@@ -1,0 +1,45 @@
+name: Native backend tests
+
+on: [push, pull_request]
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            backend: arm64
+          - runner: ubuntu-24.04
+            backend: amd64
+    runs-on: ${{ matrix.runner }}
+    env:
+      V_MACOS_V3_NO_FALLBACK: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm make time
+      - name: Bootstrap V
+        run: |
+          pin=e85e785e034bf570113bb46ec6aaea85e628aa4e
+          git init --quiet .build/source
+          git -C .build/source fetch --no-tags --depth=1 https://github.com/vlang/v.git "$pin"
+          git -C .build/source checkout --quiet --detach "$pin"
+          make -C .build/source CC=clang
+      - name: Build and check native output
+        env:
+          V3_VERIFY: '1'
+        run: |
+          .build/source/v -gc none -cc clang run tools/build.v
+          .build/source/v -gc none -cc clang run tools/bench.v --verify
+      - name: Run upstream SSA and backend tests
+        env:
+          BACKEND: ${{ matrix.backend }}
+          VFLAGS: -gc none -cc clang
+        run: |
+          compiler=$(cat .build/vopt.path)
+          cd "$(dirname "$compiler")"
+          ./v -gc none -cc clang -silent test vlib/v/ssa/optimize vlib/v/gen/nativeopt "vlib/v/gen/$BACKEND"
