@@ -1,13 +1,15 @@
 # vopt
 
-V のネイティブバックエンド向けに、整数 SSA と機械語生成を最適化する実験です。
-対象は macOS arm64（Mach-O）と Linux amd64（ELF）です。コンパイラは上流の
-エミッタとリンク経路を使います。Clang/LLVM はビルドと性能比較に使います。
+English · [日本語](README-JA.md)
 
-## ビルドと実行
+vopt is an experiment in optimizing integer SSA and machine code generation for V's native
+backends. It targets macOS arm64 (Mach-O) and Linux amd64 (ELF) and uses V's existing emitters
+and linking paths. Clang and LLVM tools are used for bootstrapping and benchmarking.
 
-最近の V、Git、Clang をインストールし、このリポジトリのルートで実行します。
-コンパイラのソースとバイナリは `.build/` 内に作成します。
+## Build and run
+
+Install a recent version of V, Git, and Clang, then run the following commands from the
+repository root. The compiler sources and binaries are stored under `.build/`.
 
 ```sh
 v -gc none run tools/build.v
@@ -20,26 +22,30 @@ compiler=$(cat .build/vopt.path)
 "$compiler" -b amd64 -prod -d vopt -o hello hello.v
 ```
 
-`-d vopt` の有無で追加の最適化を切り替えられます。`v -gc none run tools/build.v baseline`
-は未改変の比較用コンパイラだけをビルドします。`patches/` の差分はファイル名順に
-[固定した上流 V](https://github.com/vlang/v/commit/e85e785e034bf570113bb46ec6aaea85e628aa4e)
-に適用します。上流の著作権表記は [UPSTREAM-LICENSE](UPSTREAM-LICENSE) にあります。
+Use `-d vopt` with `-prod` to enable the additional optimizations. To build only the
+unmodified baseline compiler, run `v -gc none run tools/build.v baseline`. The build applies
+the files in `patches/` in filename order to the
+[pinned upstream V revision](https://github.com/vlang/v/commit/e85e785e034bf570113bb46ec6aaea85e628aa4e).
+See [UPSTREAM-LICENSE](UPSTREAM-LICENSE) for the upstream copyright notice.
 
-## 確認と性能計測
+## Verify and benchmark
 
-macOS では Xcode Command Line Tools、Linux では `llvm-objdump` と GNU `time` が必要です。
+On macOS, install the Xcode Command Line Tools. On Linux, install `llvm-objdump` and GNU `time`.
 
 ```sh
-v -gc none run tools/bench.v --verify   # 生成形式、終了コード、実行結果を比較
-v -gc none run tools/bench.v            # 4 方式の性能と逆アセンブルを保存
-v -gc none run tools/bench.v --check    # 合格基準に達しない場合は終了コード 1
+v -gc none run tools/bench.v --verify   # Compare executable formats, exit codes, and output
+v -gc none run tools/bench.v            # Save benchmark results and disassembly for all four builds
+v -gc none run tools/bench.v --check    # Exit with status 1 if any performance target is missed
 ```
 
-計測は同じ V ソースと入力で行い、上流 native `-prod`、vopt、スカラー Clang `-O3`、
-通常の Clang `-O3` を比較します。ウォームアップ後に順番をずらしながら各ケースを
-12 回計測します。生データ、コンパイラのステージ別時間、ピーク RSS、テキストサイズ、
-逆アセンブルは表示された `.build/bench-*` に保存されます。
+The benchmark runs the same V source and inputs with four builds. It compares upstream native
+`-prod`, vopt, scalar Clang `-O3` with auto-vectorization disabled, and standard Clang `-O3`.
+After a warm-up, it measures each case 12 times and rotates the order of the builds. The
+reported `.build/bench-*` directory contains the raw samples, per-stage compiler timings,
+peak RSS, text size, and disassembly.
 
-各 ISA の目標は、スカラー Clang 比で中央値の幾何平均 1.15 以下、全ケース 1.35 以下です。
-上流 native 比では実行時間のケース別悪化 5% 以内、コンパイル時間とピーク RSS の悪化
-各 20% 以内とします。性能判定は同一の対象実機上で行ってください。
+For each architecture, the performance targets relative to scalar Clang are a geometric mean
+of runtime ratios of at most 1.15 and a ratio of at most 1.35 in every case. Relative to upstream
+native V, the targets allow up to 5% longer runtime per case and up to 20% increases in both
+compilation time and peak RSS. Run performance comparisons on the same physical machine for
+each target.
