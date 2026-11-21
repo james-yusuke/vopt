@@ -8,7 +8,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
+          - runner: ubuntu-24.04-arm
             backend: arm64
           - runner: ubuntu-24.04
             backend: amd64
@@ -18,10 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Linux tools
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm make time
+          sudo apt-get install -y clang gcc libc6-dev llvm make time
       - name: Bootstrap V
         run: |
           pin=e85e785e034bf570113bb46ec6aaea85e628aa4e
@@ -40,6 +39,6 @@ jobs:
           BACKEND: ${{ matrix.backend }}
           VFLAGS: -gc none -cc clang
         run: |
-          compiler=$(cat .build/vopt.path)
-          cd "$(dirname "$compiler")"
-          ./v -gc none -cc clang -silent test vlib/v/ssa/optimize vlib/v/gen/nativeopt "vlib/v/gen/$BACKEND"
+          baseline=$(cat .build/baseline.path)
+          cd "$(dirname "$baseline")"
+          ./v -gc none -cc clang -silent test vlib/v/ssa/optimize "vlib/v/gen/$BACKEND"

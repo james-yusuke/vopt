@@ -26,18 +26,25 @@ fn source_checkout(root string) !string {
 	return source
 }
 
-fn build(root string, source string, role string, patches []string, seed string) !string {
+fn build(root string, source string, role string, seed string) !string {
 	clang := run(['clang', '--version'])!
 	mut fingerprint := '${upstream_commit}\n${role}\n${sha256.hexhash(os.read_bytes(seed)!.bytestr())}\n${clang}\n'
-	for patch in patches {
-		fingerprint += '${os.file_name(patch)} ${sha256.hexhash(os.read_file(patch)!)}\n'
+	standalone := role == 'standalone'
+	entry := if standalone { os.join_path(root, 'cmd', 'vopt') } else { 'cmd/v' }
+	output := if standalone { 'vopt' } else { 'v' }
+	if standalone {
+		mut files := os.ls(entry)!.filter(it.ends_with('.v') && !it.ends_with('_test.v'))
+		files.sort()
+		for file in files {
+			fingerprint += '${file} ${sha256.hexhash(os.read_file(os.join_path(entry, file))!)}\n'
+		}
 	}
 	base := os.join_path(root, '.build', 'compilers', sha256.hexhash(fingerprint)[..16])
-	compiler := os.join_path(base, 'v')
+	compiler := os.join_path(base, output)
 	if os.is_file(os.join_path(base, '.vopt-ready')) && os.is_executable(compiler) {
 		return compiler
 	}
-	// Each attempt has a private checkout. A failed patch or build cannot be reused.
+	// Publish the private checkout once the compiler is ready.
 	stage := os.join_path(root, '.build', 'compile-${role}-${os.getpid()}')
 	if os.exists(stage) {
 		return error('temporary build path already exists: ${stage}')
@@ -49,10 +56,6 @@ fn build(root string, source string, role string, patches []string, seed string)
 	}
 	run(['git', 'clone', '--quiet', '--shared', '--no-checkout', source, stage])!
 	run(['git', '-C', stage, 'checkout', '--quiet', '--detach', upstream_commit])!
-	for patch in patches {
-		run(['git', '-C', stage, 'apply', '--check', patch])!
-		run(['git', '-C', stage, 'apply', patch])!
-	}
 	bootstrap := os.join_path(stage, 'v-seed')
 	os.cp(seed, bootstrap)!
 	os.chmod(bootstrap, 0o755)!
@@ -62,8 +65,13 @@ fn build(root string, source string, role string, patches []string, seed string)
 	}
 	eprintln('Building ${role} at ${upstream_commit[..12]}')
 	// The seed finds the pinned vlib next to its executable.
-	run([bootstrap, '-no-retry-compilation', '-nocache', '-b', 'c', '-cc', 'clang', '-gc', 'none',
-		'-compile-backend', 'amd64,arm64', '-o', 'v', 'cmd/v'])!
+	mut args := [bootstrap, '-no-retry-compilation', '-nocache', '-b', 'c', '-cc', 'clang', '-gc',
+		'none']
+	if !standalone {
+		args << ['-compile-backend', 'amd64,arm64']
+	}
+	args << ['-o', output, entry]
+	run(args)!
 	os.rm(bootstrap)!
 	os.write_file('.vopt-ready', fingerprint)!
 	os.chdir(root)!
@@ -96,19 +104,17 @@ fn build_compilers() ! {
 	os.unsetenv('VEXE')
 	os.mkdir_all('.build')!
 	source := source_checkout(root)!
-	baseline := build(root, source, 'baseline', [], @VEXE)!
+	baseline := build(root, source, 'baseline', @VEXE)!
 	os.write_file('.build/baseline.path', baseline + '\n')!
 	println('baseline ${baseline}')
 	if os.args.len == 2 {
 		return
 	}
-	mut patches := os.ls('patches')!.filter(it.ends_with('.patch'))
-	patches.sort()
-	if patches.len == 0 {
-		return error('no compiler patches found')
-	}
-	patches = patches.map(os.join_path(root, 'patches', it))
-	optimized := build(root, source, 'vopt', patches, baseline)!
+	optimized := build(root, source, 'standalone', baseline)!
 	os.write_file('.build/vopt.path', optimized + '\n')!
+	link := '.build/vopt-link-${os.getpid()}'
+	os.symlink(optimized, link)!
+	defer { os.rm(link) or {} }
+	os.rename(link, '.build/vopt')!
 	println('vopt ${optimized}')
 }

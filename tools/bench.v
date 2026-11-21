@@ -8,9 +8,10 @@ const kernels = ['reduce', 'scan', 'branches', 'division', 'nested', 'calls']
 const samples = 12
 
 struct Variant {
-	name     string
-	compiler string
-	flags    []string
+	name       string
+	compiler   string
+	flags      []string
+	standalone bool
 }
 
 struct Sample {
@@ -33,16 +34,15 @@ fn run(args []string) !string {
 }
 
 fn compile(variant Variant, source string, output string, measure bool) !BuildStats {
-	mut args := [variant.compiler, '-no-retry-compilation', '-nocache', '-gc', 'none', '-show-timings',
-		'-o', output]
+	mut args := [variant.compiler]
+	if !variant.standalone {
+		args << ['-no-retry-compilation', '-nocache', '-gc', 'none', '-show-timings']
+	}
+	args << ['-o', output]
 	args << variant.flags
 	args << source
 	if measure {
-		$if macos {
-			args.prepend(['/usr/bin/time', '-l'])
-		} $else {
-			args.prepend(['/usr/bin/time', '-v'])
-		}
+		args.prepend(['/usr/bin/time', '-v'])
 	}
 	start := time.sys_mono_now()
 	log := run(args)!
@@ -50,9 +50,7 @@ fn compile(variant Variant, source string, output string, measure bool) !BuildSt
 	os.write_file(output + '.build.log', log)!
 	mut rss := u64(0)
 	for line in log.split_into_lines() {
-		if line.contains('maximum resident set size') {
-			rss = line.trim_space().fields()[0].u64()
-		} else if line.contains('Maximum resident set size (kbytes):') {
+		if line.contains('Maximum resident set size (kbytes):') {
 			rss = line.all_after_last(':').trim_space().u64() * 1024
 		}
 	}
@@ -65,19 +63,13 @@ fn compile(variant Variant, source string, output string, measure bool) !BuildSt
 }
 
 fn inspect_object(path string, disassemble bool) !u64 {
-	objdump := $if macos { ['xcrun', 'llvm-objdump'] } $else { ['llvm-objdump'] }
-	sections := run(arrays_join(objdump, ['--section-headers', path]))!
-	$if macos {
-		if !sections.contains('file format mach-o arm64') {
-			return error('expected arm64 Mach-O at ${path}')
-		}
-	} $else {
-		if !sections.contains('file format elf64-x86-64') {
-			return error('expected amd64 ELF at ${path}')
-		}
+	sections := run(['llvm-objdump', '--section-headers', path])!
+	format := $if arm64 { 'elf64-littleaarch64' } $else { 'elf64-x86-64' }
+	if !sections.contains('file format ${format}') {
+		return error('expected ${format} at ${path}')
 	}
 	if disassemble {
-		os.write_file(path + '.asm', run(arrays_join(objdump, ['-d', path, '--no-show-raw-insn']))!)!
+		os.write_file(path + '.asm', run(['llvm-objdump', '-d', path, '--no-show-raw-insn'])!)!
 	}
 	for line in sections.split_into_lines() {
 		fields := line.fields()
@@ -86,12 +78,6 @@ fn inspect_object(path string, disassemble bool) !u64 {
 		}
 	}
 	return error('no text section in ${path}')
-}
-
-fn arrays_join(first []string, second []string) []string {
-	mut result := first.clone()
-	result << second
-	return result
 }
 
 fn kernel_sample(path string, kernel string, seed string, size string, repeat string) !Sample {
@@ -128,27 +114,39 @@ fn benchmark() ! {
 	os.setenv('LC_ALL', 'C', true)
 	os.unsetenv('VFLAGS')
 	os.unsetenv('VEXE')
-	backend := $if macos && arm64 {
+	backend := $if linux && arm64 {
 		'arm64'
 	} $else $if linux && amd64 {
 		'amd64'
 	} $else {
-		return error('run on macOS arm64 or Linux amd64')
+		return error('run on Linux amd64 or Linux arm64')
 	}
 	baseline := os.read_file('.build/baseline.path')!.trim_space()
-	mut variants := [Variant{'upstream', baseline, ['-b', backend, '-prod']}]
+	if backend == 'arm64' {
+		prepare_arm64_baseline(baseline)!
+	}
+	mut variants := [Variant{ name: 'upstream', compiler: baseline, flags: ['-b', backend, '-prod'] }]
 	vopt := if mode == '--baseline' { '' } else { os.read_file('.build/vopt.path')!.trim_space() }
 	if vopt != '' {
-		variants << Variant{'vopt', vopt, ['-b', backend, '-prod', '-d', 'vopt']}
-		if verify {
-			variants << Variant{'vopt-default', vopt, ['-b', backend, '-prod']}
+		variants << Variant{
+			name:       'vopt'
+			compiler:   vopt
+			flags:      ['--arch', backend]
+			standalone: true
 		}
 	}
 	scalar_index := variants.len
-	variants << Variant{'clang-scalar', baseline, ['-b', 'c', '-cc', 'clang', '-prod',
-		'-no-prod-options', '-cflags', '-O3 -fno-vectorize -fno-slp-vectorize']}
-	variants << Variant{'clang-o3', baseline, ['-b', 'c', '-cc', 'clang', '-prod', '-no-prod-options',
-		'-cflags', '-O3']}
+	variants << Variant{
+		name:     'clang-scalar'
+		compiler: baseline
+		flags:    ['-b', 'c', '-cc', 'clang', '-prod', '-no-prod-options', '-cflags',
+			'-O3 -fno-vectorize -fno-slp-vectorize']
+	}
+	variants << Variant{
+		name:     'clang-o3'
+		compiler: baseline
+		flags:    ['-b', 'c', '-cc', 'clang', '-prod', '-no-prod-options', '-cflags', '-O3']
+	}
 	root := os.join_path(os.getwd(), '.build', 'bench-${os.getpid()}')
 	os.mkdir_all(root)!
 	println('Results directory ${root}')
@@ -174,6 +172,7 @@ fn benchmark() ! {
 	}
 	if verify {
 		verify_outputs(variants, paths, root)!
+		verify_source_pipeline(vopt, backend, root)!
 		println('Differential checks passed on ${backend}')
 		return
 	}
@@ -225,6 +224,40 @@ fn benchmark() ! {
 	}
 	if mode == '--check' && !checks_ok {
 		return error('performance criteria did not pass; see ${root}')
+	}
+}
+
+fn prepare_arm64_baseline(compiler string) ! {
+	// The pinned upstream ARM64 driver forwards these #flag object paths to cc.
+	vlib := os.join_path(os.dir(compiler), 'vlib')
+	for name in ['os/execute_capture_nix', 'sync/thread_helper'] {
+		stem := os.join_path(vlib, name)
+		object := stem + '.o'
+		if os.is_file(object) {
+			continue
+		}
+		temp := '${stem}-${os.getpid()}.o'
+		defer { os.rm(temp) or {} }
+		run(['cc', '-O2', '-fPIC', '-pthread', '-c', stem + '.c', '-o', temp])!
+		os.rename(temp, object)!
+	}
+}
+
+fn verify_source_pipeline(compiler string, arch string, root string) ! {
+	program := os.join_path(root, 'imported-project')
+	run([compiler, '--arch', arch, '-o', program, 'tests/project'])!
+	expected := if arch == 'amd64' { 'amd64 106\n' } else { 'arm64 46\n' }
+	if run([program])! != expected {
+		return error('unexpected output from the ${arch} module and generics test')
+	}
+	invalid := os.join_path(root, 'invalid.v')
+	output := os.join_path(root, 'failed-build')
+	for source in ['fn main( {', 'fn main() { println(unknown_name) }'] {
+		os.write_file(invalid, source)!
+		result := os.exec([compiler, '--arch', arch, '-o', output, invalid])
+		if result.exit_code != 1 || !result.output.contains('invalid.v:') || os.exists(output) {
+			return error('invalid source was not diagnosed correctly: ${result.output}')
+		}
 	}
 }
 
