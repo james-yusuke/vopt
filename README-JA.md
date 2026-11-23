@@ -33,6 +33,18 @@ vopt は固定した上流 V のソースをそのまま使い、上流の SSA �
 `v -gc none run tools/build.v baseline` を使います。
 [固定した上流 V](https://github.com/vlang/v/commit/e85e785e034bf570113bb46ec6aaea85e628aa4e) · [上流の MIT ライセンス](https://github.com/vlang/v/blob/e85e785e034bf570113bb46ec6aaea85e628aa4e/LICENSE)
 
+## V の SSA を出力する
+
+```sh
+.build/vopt --emit-ssa --arch amd64 hello.v
+.build/vopt --emit-ssa --arch arm64 -o hello.ssa hello.v
+```
+
+`--emit-ssa` は V の内部表現 `v.ssa.Module` を、両ターゲットで上流の
+`V_X64_DUMP_SSA` と同じテキスト形式で出力します。φ ノードを保持したまま SSA 最適化
+までで処理を終えます。既定では標準出力に書き込み、`-o` でファイルを指定できます。
+[上流の SSA 出力形式](https://github.com/vlang/v/blob/e85e785e034bf570113bb46ec6aaea85e628aa4e/vlib/v/gen/amd64/gen.v#L597)
+
 ## 確認と性能計測
 
 `llvm-objdump` と GNU `time` をインストールした Linux amd64・arm64 上で実行します。

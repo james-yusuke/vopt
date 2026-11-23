@@ -32,6 +32,18 @@ vopt builds against an unmodified checkout of V and uses its SSA optimizer and n
 generators. Run `v -gc none run tools/build.v baseline` to build the upstream comparison
 compiler by itself. [Pinned V revision](https://github.com/vlang/v/commit/e85e785e034bf570113bb46ec6aaea85e628aa4e) · [Upstream MIT license](https://github.com/vlang/v/blob/e85e785e034bf570113bb46ec6aaea85e628aa4e/LICENSE)
 
+## Dump V SSA
+
+```sh
+.build/vopt --emit-ssa --arch amd64 hello.v
+.build/vopt --emit-ssa --arch arm64 -o hello.ssa hello.v
+```
+
+`--emit-ssa` writes V's internal `v.ssa.Module` using the upstream
+`V_X64_DUMP_SSA` text format on both targets. It stops after SSA optimization,
+with phi nodes intact. The default destination is standard output. Use `-o`
+to save the dump to a file. [Upstream SSA dump format](https://github.com/vlang/v/blob/e85e785e034bf570113bb46ec6aaea85e628aa4e/vlib/v/gen/amd64/gen.v#L597)
+
 ## Verify and benchmark
 
 Run these checks on Linux amd64 or arm64 with `llvm-objdump` and GNU `time` installed.

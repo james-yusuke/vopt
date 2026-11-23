@@ -250,6 +250,7 @@ fn verify_source_pipeline(compiler string, arch string, root string) ! {
 	if run([program])! != expected {
 		return error('unexpected output from the ${arch} module and generics test')
 	}
+	verify_ssa_dump(compiler, arch, root)!
 	invalid := os.join_path(root, 'invalid.v')
 	output := os.join_path(root, 'failed-build')
 	for source in ['fn main( {', 'fn main() { println(unknown_name) }'] {
@@ -258,6 +259,25 @@ fn verify_source_pipeline(compiler string, arch string, root string) ! {
 		if result.exit_code != 1 || !result.output.contains('invalid.v:') || os.exists(output) {
 			return error('invalid source was not diagnosed correctly: ${result.output}')
 		}
+	}
+}
+
+fn verify_ssa_dump(compiler string, arch string, root string) ! {
+	path := os.join_path(root, 'imported-project.ssa')
+	mut args := [compiler, '--emit-ssa', '--arch', arch, '--cc', os.join_path(root, 'missing-linker'),
+		'tests/project']
+	stdout_text := run(args)!
+	args << ['-o', path]
+	file_message := run(args)!
+	file_text := os.read_file(path)!
+	if file_message != '' || file_text != stdout_text {
+		return error('SSA dump differs between stdout and file output on ${arch}')
+	}
+	entry := stdout_text.all_after('\nSSA function main ret=0\n').all_before('\nSSA function ')
+	sum := stdout_text.all_after('\nSSA function calc.sum_T_u64 ').all_before('\nSSA function ')
+	if !entry.starts_with('SSA block ') || !entry.contains(':${arch} ')
+		|| !sum.contains('\nSSA param ') || !sum.contains(' phi typ=') {
+		return error('SSA dump is missing the ${arch} entry point or the generic loop with phi nodes')
 	}
 }
 

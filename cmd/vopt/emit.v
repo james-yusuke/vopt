@@ -9,8 +9,8 @@ import v.tempname
 fn compile(options Options) ! {
 	prefs := source_preferences(options)
 	files := source_files(options.input, prefs)!
-	output_path := os.real_path(options.output)
-	if os.is_dir(options.output) || output_path in files {
+	output_path := if options.output == '' { '' } else { os.real_path(options.output) }
+	if output_path != '' && (os.is_dir(output_path) || output_path in files) {
 		return error('output path would replace a source file or directory: ${options.output}')
 	}
 	mut ast := load_ast(files, prefs)!
@@ -22,6 +22,10 @@ fn compile(options Options) ! {
 	mut ir := lower_to_ssa(mut ast, prefs)!
 	if ir.errors.len > 0 {
 		return error(ir.errors.join('\n'))
+	}
+	if options.emit_ssa {
+		dump_ssa(mut ir, options.output)!
+		return
 	}
 	// Preserve the upstream amd64 limit for the whole-module optimizer.
 	if options.target.arch != 'amd64' || ir.values.len <= 1_000_000 {

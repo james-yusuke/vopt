@@ -3,13 +3,14 @@ module main
 import os
 import v.pref
 
-const usage = 'Usage: vopt [--arch amd64|arm64] [--cc compiler] [-o output] <file.v|directory>'
+const usage = 'Usage: vopt [--emit-ssa] [--arch amd64|arm64] [--cc compiler] [-o output] <file.v|directory>'
 
 struct Options {
-	target pref.Target
-	input  string
-	output string
-	cc     string
+	target   pref.Target
+	input    string
+	output   string
+	cc       string
+	emit_ssa bool
 }
 
 fn main() {
@@ -32,6 +33,7 @@ fn parse_args(args []string) !Options {
 	mut input := ''
 	mut output := ''
 	mut cc := ''
+	mut emit_ssa := false
 	mut i := 0
 	for i < args.len {
 		arg := args[i]
@@ -45,6 +47,8 @@ fn parse_args(args []string) !Options {
 				'--cc' { cc = args[i] }
 				else { output = args[i] }
 			}
+		} else if arg == '--emit-ssa' {
+			emit_ssa = true
 		} else {
 			if arg.starts_with('-') {
 				return error('unknown option ${arg}')
@@ -62,7 +66,7 @@ fn parse_args(args []string) !Options {
 	if arch !in ['amd64', 'arm64'] {
 		return error('unsupported Linux architecture ${arch}')
 	}
-	if output == '' {
+	if output == '' && !emit_ssa {
 		name := os.file_name(os.real_path(input))
 		output = if os.is_dir(input) { name } else { name.trim_string_right('.v') }
 	}
@@ -76,5 +80,11 @@ fn parse_args(args []string) !Options {
 			'x86_64-linux-gnu-gcc'
 		}
 	}
-	return Options{pref.target_from('linux', arch)!, os.real_path(input), os.abs_path(output), cc}
+	return Options{
+		target:   pref.target_from('linux', arch)!
+		input:    os.real_path(input)
+		output:   if output == '' { '' } else { os.abs_path(output) }
+		cc:       cc
+		emit_ssa: emit_ssa
+	}
 }
